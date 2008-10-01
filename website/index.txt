@@ -21,18 +21,29 @@ The following configuration options are available:
 
 * set to true if columns with DATE in their name should be emulated as Date (and not as Time which is default)
 <pre syntax="ruby">
-ActiveRecord::ConnectionAdapters::OracleEnhancedAdapter.emulate_dates_by_column_name = true
+ActiveRecord::ConnectionAdapters::OracleEnhancedAdapter.
+  emulate_dates_by_column_name = true
 </pre>
 
 * set to true if columns with ID at the end of column name should be emulated as Fixnum (and not as BigDecimal which is default)
 <pre syntax="ruby">
-ActiveRecord::ConnectionAdapters::OracleEnhancedAdapter.emulate_integers_by_column_name = true
+ActiveRecord::ConnectionAdapters::OracleEnhancedAdapter.
+  emulate_integers_by_column_name = true
 </pre>
 
 * set to true if CHAR(1), VARCHAR2(1) columns or or VARCHAR2 columns with FLAG or YN at the end of their name
   should be emulated as booleans (and do not use NUMBER(1) as type for booleans which is default)
 <pre syntax="ruby">
-ActiveRecord::ConnectionAdapters::OracleEnhancedAdapter.emulate_booleans_from_strings = true
+ActiveRecord::ConnectionAdapters::OracleEnhancedAdapter.
+  emulate_booleans_from_strings = true
+</pre>
+
+* specify other date and time formats that should be used when assigning string values to :date and :datetime columns, e.g.:
+<pre syntax="ruby">
+ActiveRecord::ConnectionAdapters::OracleEnhancedAdapter.instance_eval do
+  self.string_to_date_format = "%d.%m.%Y"
+  self.string_to_time_format = "%d.%m.%Y %H:%M:%S"
+end
 </pre>
 
 The following model class methods are available:
@@ -65,7 +76,9 @@ set_delete_method do
 end
 </pre>
 
-See http://blog.rayapps.com for more information.
+Oracle enhanced adapter is also compatible with composite_primary_keys gem.
+
+See http://blog.rayapps.com/category/oracle-enhanced for more information.
 
 Look ar RSpec tests under spec directory for usage examples.
 

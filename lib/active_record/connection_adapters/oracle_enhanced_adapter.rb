@@ -61,7 +61,8 @@ begin
       # and write back the data.
       after_save :enhanced_write_lobs
       def enhanced_write_lobs #:nodoc:
-        if connection.is_a?(ConnectionAdapters::OracleEnhancedAdapter)
+        if connection.is_a?(ConnectionAdapters::OracleEnhancedAdapter) &&
+            !(self.class.custom_create_method || self.class.custom_update_method)
           connection.write_lobs(self.class.table_name, self.class, attributes)
         end
       end
@@ -112,6 +113,32 @@ begin
         def guess_date_or_time(value)
           (value.hour == 0 and value.min == 0 and value.sec == 0) ?
             Date.new(value.year, value.month, value.day) : value
+        end
+        
+        class <<self
+          protected
+
+          def fallback_string_to_date(string)
+            if OracleEnhancedAdapter.string_to_date_format || OracleEnhancedAdapter.string_to_time_format
+              return (string_to_date_or_time_using_format(string).to_date rescue super)
+            end
+            super
+          end
+
+          def fallback_string_to_time(string)
+            if OracleEnhancedAdapter.string_to_time_format || OracleEnhancedAdapter.string_to_date_format
+              return (string_to_date_or_time_using_format(string).to_time rescue super)
+            end
+            super
+          end
+
+          def string_to_date_or_time_using_format(string)
+            if OracleEnhancedAdapter.string_to_time_format && dt=Date._strptime(string, OracleEnhancedAdapter.string_to_time_format)
+              return Time.mktime(*dt.values_at(:year, :mon, :mday, :hour, :min, :sec, :zone, :wday))
+            end
+            DateTime.strptime(string, OracleEnhancedAdapter.string_to_date_format)
+          end
+          
         end
       end
 
@@ -181,6 +208,10 @@ begin
         def self.boolean_to_string(bool)
           bool ? "Y" : "N"
         end
+
+        # RSI: use to set NLS specific date formats which will be used when assigning string to :date and :datetime columns
+        @@string_to_date_format = @@string_to_time_format = nil
+        cattr_accessor :string_to_date_format, :string_to_time_format
 
         def adapter_name #:nodoc:
           'OracleEnhanced'
@@ -383,9 +414,11 @@ begin
             value = attributes[col.name]
             value = value.to_yaml if col.text? && klass.serialized_attributes[col.name]
             next if value.nil?  || (value == '')
-            lob = select_one("SELECT #{col.name} FROM #{table_name} WHERE #{klass.primary_key} = #{id}",
-                             'Writable Large Object')[col.name]
-            lob.write value
+            uncached do
+              lob = select_one("SELECT #{col.name} FROM #{table_name} WHERE #{klass.primary_key} = #{id} FOR UPDATE",
+                               'Writable Large Object')[col.name]
+              lob.write value
+            end
           end
         end
 
@@ -408,10 +441,11 @@ begin
         def indexes(table_name, name = nil) #:nodoc:
           result = select_all(<<-SQL, name)
             SELECT lower(i.index_name) as index_name, i.uniqueness, lower(c.column_name) as column_name
-              FROM user_indexes i, user_ind_columns c
+              FROM all_indexes i, user_ind_columns c
              WHERE i.table_name = '#{table_name.to_s.upcase}'
                AND c.index_name = i.index_name
                AND i.index_name NOT IN (SELECT uc.index_name FROM user_constraints uc WHERE uc.constraint_type = 'P')
+               AND i.owner = sys_context('userenv','session_user')
               ORDER BY i.index_name, c.column_position
           SQL
 
@@ -554,7 +588,7 @@ begin
           select_all("select table_name from all_tables where owner = sys_context('userenv','session_user')").inject(s) do |structure, table|
             ddl = "create table #{table.to_a.first.last} (\n "
             cols = select_all(%Q{
-              select column_name, data_type, data_length, data_precision, data_scale, data_default, nullable
+              select column_name, data_type, data_length, char_used, char_length, data_precision, data_scale, data_default, nullable
               from user_tab_columns
               where table_name = '#{table.to_a.first.last}'
               order by column_id
@@ -565,7 +599,8 @@ begin
                 col << ",#{row['data_scale'].to_i}" if !row['data_scale'].nil?
                 col << ')'
               elsif row['data_type'].include?('CHAR')
-                col << "(#{row['data_length'].to_i})"
+                length = row['char_used'] == 'C' ? row['char_length'].to_i : row['data_length'].to_i
+                col <<  "(#{length})"
               end
               col << " default #{row['data_default']}" if !row['data_default'].nil?
               col << ' not null' if row['nullable'] == 'N'

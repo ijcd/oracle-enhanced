@@ -35,6 +35,10 @@ describe "OracleEnhancedAdapter schema dump" do
     @new_conn.tables.should == @old_conn.tables
   end
 
+  it "should return the same index list as original oracle adapter" do
+    @new_conn.indexes('employees').should == @old_conn.indexes('employees')
+  end
+
   it "should return the same pk_and_sequence_for as original oracle adapter" do
     @new_conn.tables.each do |t|
       @new_conn.pk_and_sequence_for(t).should == @old_conn.pk_and_sequence_for(t)
@@ -48,7 +52,43 @@ describe "OracleEnhancedAdapter schema dump" do
   it "should return the same structure drop as original oracle adapter" do
     @new_conn.structure_drop.should == @old_conn.structure_drop
   end
+  
+  it "should return the character size of nvarchar fields" do
+    @new_conn.execute <<-SQL
+      CREATE TABLE nvarchartable (
+        session_id  NVARCHAR2(255) DEFAULT NULL
+      )
+    SQL
+    if /.*session_id nvarchar2\((\d+)\).*/ =~ @new_conn.structure_dump
+       "#$1".should == "255"
+    end
+    @new_conn.execute "DROP TABLE nvarchartable"
+  end
+end
 
+describe "OracleEnhancedAdapter database stucture dump extentions" do
+  before(:all) do
+    ActiveRecord::Base.establish_connection(:adapter => "oracle_enhanced",
+                                            :database => "xe",
+                                            :username => "hr",
+                                            :password => "hr")
+    @conn = ActiveRecord::Base.connection
+    @conn.execute <<-SQL
+      CREATE TABLE nvarchartable (
+        unq_nvarchar  NVARCHAR2(255) DEFAULT NULL
+      )
+    SQL
+  end
+  
+  after(:all) do
+    @conn.execute "DROP TABLE nvarchartable"
+  end
+  
+  it "should return the character size of nvarchar fields" do
+    if /.*unq_nvarchar nvarchar2\((\d+)\).*/ =~ @conn.structure_dump
+       "#$1".should == "255"
+    end
+  end
 end
 
 describe "OracleEnhancedAdapter database session store" do
@@ -97,6 +137,8 @@ describe "OracleEnhancedAdapter database session store" do
     @session.save!
     @session = CGI::Session::ActiveRecordStore::Session.find_by_session_id("222222")
     @session.data = "other thing"
+    @session.save!
+    # second save should call again blob writing callback
     @session.save!
     @session = CGI::Session::ActiveRecordStore::Session.find_by_session_id("222222")
     @session.data.should == "other thing"
@@ -200,6 +242,10 @@ describe "OracleEnhancedAdapter date type detection based on column names" do
       end
     end
 
+    after(:all) do
+      Object.send(:remove_const, "TestEmployee")
+    end
+    
     before(:each) do
       @employee = TestEmployee.create(
         :first_name => "First",
@@ -731,4 +777,137 @@ describe "OracleEnhancedAdapter date and timestamp with different NLS date forma
                                 "#{"%02d" % @ts.hour}:#{"%02d" % @ts.min}:#{"%02d" % @ts.sec}.100000','YYYY-MM-DD HH24:MI:SS.FF6')"
   end
 
+end
+
+describe "OracleEnhancedAdapter assign string to :date and :datetime columns" do
+  before(:all) do
+    ActiveRecord::Base.establish_connection(:adapter => "oracle_enhanced",
+                                            :database => "xe",
+                                            :username => "hr",
+                                            :password => "hr")
+    @conn = ActiveRecord::Base.connection
+    @conn.execute <<-SQL
+      CREATE TABLE test_employees (
+        employee_id   NUMBER(6,0),
+        first_name    VARCHAR2(20),
+        last_name     VARCHAR2(25),
+        hire_date     DATE,
+        last_login_at    DATE,
+        last_login_at_ts   TIMESTAMP
+      )
+    SQL
+    @conn.execute <<-SQL
+      CREATE SEQUENCE test_employees_seq  MINVALUE 1
+        INCREMENT BY 1 CACHE 20 NOORDER NOCYCLE
+    SQL
+    class TestEmployee < ActiveRecord::Base
+      set_primary_key :employee_id
+    end
+  end
+  
+  after(:all) do
+    Object.send(:remove_const, "TestEmployee")
+    @conn.execute "DROP TABLE test_employees"
+    @conn.execute "DROP SEQUENCE test_employees_seq"
+  end
+
+  before(:each) do
+    @today = Date.new(2008,6,28)
+    @today_iso = "2008-06-28"
+    @today_nls = "28.06.2008"
+    @nls_date_format = "%d.%m.%Y"
+    @now = Time.local(2008,6,28,13,34,33)
+    @now_iso = "2008-06-28 13:34:33"
+    @now_nls = "28.06.2008 13:34:33"
+    @nls_time_format = "%d.%m.%Y %H:%M:%S"
+    ActiveRecord::ConnectionAdapters::OracleEnhancedAdapter.emulate_dates_by_column_name = true
+  end
+  
+  it "should assign ISO string to date column" do
+    @employee = TestEmployee.create(
+      :first_name => "First",
+      :last_name => "Last",
+      :hire_date => @today_iso
+    )
+    @employee.reload
+    @employee.hire_date.should == @today
+  end
+
+  it "should assign NLS string to date column" do
+    ActiveRecord::ConnectionAdapters::OracleEnhancedAdapter.string_to_date_format = @nls_date_format
+    @employee = TestEmployee.create(
+      :first_name => "First",
+      :last_name => "Last",
+      :hire_date => @today_nls
+    )
+    @employee.reload
+    @employee.hire_date.should == @today
+  end
+
+  it "should assign ISO time string to date column" do
+    @employee = TestEmployee.create(
+      :first_name => "First",
+      :last_name => "Last",
+      :hire_date => @now_iso
+    )
+    @employee.reload
+    @employee.hire_date.should == @today
+  end
+
+  it "should assign NLS time string to date column" do
+    # ActiveRecord::ConnectionAdapters::OracleEnhancedAdapter.string_to_date_format = @nls_date_format
+    ActiveRecord::ConnectionAdapters::OracleEnhancedAdapter.string_to_time_format = @nls_time_format
+    @employee = TestEmployee.create(
+      :first_name => "First",
+      :last_name => "Last",
+      :hire_date => @now_nls
+    )
+    @employee.reload
+    @employee.hire_date.should == @today
+  end
+
+  it "should assign ISO time string to datetime column" do
+    @employee = TestEmployee.create(
+      :first_name => "First",
+      :last_name => "Last",
+      :last_login_at => @now_iso
+    )
+    @employee.reload
+    @employee.last_login_at.should == @now
+  end
+
+  it "should assign NLS time string to datetime column" do
+    # ActiveRecord::ConnectionAdapters::OracleEnhancedAdapter.string_to_date_format = @nls_date_format
+    ActiveRecord::ConnectionAdapters::OracleEnhancedAdapter.string_to_time_format = @nls_time_format
+    @employee = TestEmployee.create(
+      :first_name => "First",
+      :last_name => "Last",
+      :last_login_at => @now_nls
+    )
+    @employee.reload
+    @employee.last_login_at.should == @now
+  end
+  
+  it "should assign ISO date string to datetime column" do
+    @employee = TestEmployee.create(
+      :first_name => "First",
+      :last_name => "Last",
+      :last_login_at => @today_iso
+    )
+    @employee.reload
+    @employee.last_login_at.should == @today.to_time
+  end
+
+  it "should assign NLS date string to datetime column" do
+    ActiveRecord::ConnectionAdapters::OracleEnhancedAdapter.string_to_date_format = @nls_date_format
+    # ActiveRecord::ConnectionAdapters::OracleEnhancedAdapter.string_to_time_format = @nls_time_format
+    @employee = TestEmployee.create(
+      :first_name => "First",
+      :last_name => "Last",
+      :last_login_at => @today_nls
+    )
+    @employee.reload
+    @employee.last_login_at.should == @today.to_time
+  end
+  
 end
