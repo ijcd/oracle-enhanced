@@ -57,6 +57,21 @@ begin
         connection.ignore_table_columns(table_name,*args)
       end
 
+      # RSI: specify which table columns should be treated as date (without time)
+      def self.set_date_columns(*args)
+        connection.set_type_for_columns(table_name,:date,*args)
+      end
+
+      # RSI: specify which table columns should be treated as datetime
+      def self.set_datetime_columns(*args)
+        connection.set_type_for_columns(table_name,:datetime,*args)
+      end
+
+      # RSI: specify which table columns should be treated as booleans
+      def self.set_boolean_columns(*args)
+        connection.set_type_for_columns(table_name,:boolean,*args)
+      end
+
       # After setting large objects to empty, select the OCI8::LOB
       # and write back the data.
       after_save :enhanced_write_lobs
@@ -66,16 +81,47 @@ begin
           connection.write_lobs(self.class.table_name, self.class, attributes)
         end
       end
-
       private :enhanced_write_lobs
+      
+      class << self
+        # RSI: patch ORDER BY to work with LOBs
+        def add_order_with_lobs!(sql, order, scope = :auto)
+          if connection.is_a?(ConnectionAdapters::OracleEnhancedAdapter)
+            order = connection.lob_order_by_expression(self, order) if order
+            
+            orig_scope = scope
+            scope = scope(:find) if :auto == scope
+            if scope
+              new_scope_order = connection.lob_order_by_expression(self, scope[:order])
+              if new_scope_order != scope[:order]
+                scope = scope.merge(:order => new_scope_order)
+              else
+                scope = orig_scope
+              end
+            end
+          end
+          add_order_without_lobs!(sql, order, scope = :auto)
+        end
+        private :add_order_with_lobs!
+        alias_method :add_order_without_lobs!, :add_order!
+        alias_method :add_order!, :add_order_with_lobs!
+      end
+      
     end
 
 
     module ConnectionAdapters #:nodoc:
       class OracleEnhancedColumn < Column #:nodoc:
 
+        attr_reader :table_name, :forced_column_type
+        
+        def initialize(name, default, sql_type = nil, null = true, table_name = nil, forced_column_type = nil)
+          @table_name = table_name
+          @forced_column_type = forced_column_type
+          super(name, default, sql_type, null)
+        end
+
         def type_cast(value)
-          return value.to_date if type == :date && OracleEnhancedAdapter.emulate_dates_by_column_name && value.class == Time
           return guess_date_or_time(value) if type == :datetime && OracleEnhancedAdapter.emulate_dates
           super
         end
@@ -89,29 +135,44 @@ begin
             %w(true t 1 y +).include?(value.to_s.downcase)
           end
         end
+
+        # RSI: convert Time value to Date for :date columns
+        def self.string_to_date(string)
+          return string.to_date if string.is_a?(Time)
+          super
+        end
+
+        # RSI: convert Date value to Time for :datetime columns
+        def self.string_to_time(string)
+          return string.to_time if string.is_a?(Date) && !OracleEnhancedAdapter.emulate_dates
+          super
+        end
         
         private
         def simplified_type(field_type)
           return :boolean if OracleEnhancedAdapter.emulate_booleans && field_type == 'NUMBER(1)'
           return :boolean if OracleEnhancedAdapter.emulate_booleans_from_strings &&
-                            OracleEnhancedAdapter.is_boolean_column?(name, field_type)
+                            (forced_column_type == :boolean ||
+                            OracleEnhancedAdapter.is_boolean_column?(name, field_type, table_name))
+          
           case field_type
             when /date/i
-              return :date if OracleEnhancedAdapter.emulate_dates_by_column_name && OracleEnhancedAdapter.is_date_column?(name)
+              forced_column_type ||
+              (:date if OracleEnhancedAdapter.emulate_dates_by_column_name && OracleEnhancedAdapter.is_date_column?(name, table_name)) ||
               :datetime
             when /timestamp/i then :timestamp
             when /time/i then :datetime
             when /decimal|numeric|number/i
               return :integer if extract_scale(field_type) == 0
               # RSI: if column name is ID or ends with _ID
-              return :integer if OracleEnhancedAdapter.emulate_integers_by_column_name && OracleEnhancedAdapter.is_integer_column?(name)
+              return :integer if OracleEnhancedAdapter.emulate_integers_by_column_name && OracleEnhancedAdapter.is_integer_column?(name, table_name)
               :decimal
             else super
           end
         end
 
         def guess_date_or_time(value)
-          (value.hour == 0 and value.min == 0 and value.sec == 0) ?
+          value.respond_to?(:hour) && (value.hour == 0 and value.min == 0 and value.sec == 0) ?
             Date.new(value.year, value.month, value.day) : value
         end
         
@@ -186,14 +247,25 @@ begin
         # RSI: set to true if columns with DATE in their name should be emulated as date
         @@emulate_dates_by_column_name = false
         cattr_accessor :emulate_dates_by_column_name
-        def self.is_date_column?(name)
+        def self.is_date_column?(name, table_name = nil)
           name =~ /(^|_)date(_|$)/i
+        end
+        # RSI: instance method uses at first check if column type defined at class level
+        def is_date_column?(name, table_name = nil)
+          case get_type_for_column(table_name, name)
+          when nil
+            self.class.is_date_column?(name, table_name)
+          when :date
+            true
+          else
+            false
+          end
         end
 
         # RSI: set to true if NUMBER columns with ID at the end of their name should be emulated as integers
         @@emulate_integers_by_column_name = false
         cattr_accessor :emulate_integers_by_column_name
-        def self.is_integer_column?(name)
+        def self.is_integer_column?(name, table_name = nil)
           name =~ /(^|_)id$/i
         end
 
@@ -201,7 +273,7 @@ begin
         # should be emulated as booleans
         @@emulate_booleans_from_strings = false
         cattr_accessor :emulate_booleans_from_strings
-        def self.is_boolean_column?(name, field_type)
+        def self.is_boolean_column?(name, field_type, table_name = nil)
           return true if ["CHAR(1)","VARCHAR2(1)"].include?(field_type)
           field_type =~ /^VARCHAR2/ && (name =~ /_flag$/i || name =~ /_yn$/i)
         end
@@ -377,9 +449,11 @@ begin
         end
 
         def add_limit_offset!(sql, options) #:nodoc:
-          offset = options[:offset] || 0
+          # RSI: added to_i for limit and offset to protect from SQL injection
+          offset = (options[:offset] || 0).to_i
 
           if limit = options[:limit]
+            limit = limit.to_i
             sql.replace "select * from (select raw_sql_.*, rownum raw_rnum_ from (#{sql}) raw_sql_ where rownum <= #{offset+limit}) where raw_rnum_ > #{offset}"
           elsif offset > 0
             sql.replace "select * from (select raw_sql_.*, rownum raw_rnum_ from (#{sql}) raw_sql_) where raw_rnum_ > #{offset}"
@@ -412,8 +486,9 @@ begin
           id = quote(attributes[klass.primary_key])
           klass.columns.select { |col| col.sql_type =~ /LOB$/i }.each do |col|
             value = attributes[col.name]
-            value = value.to_yaml if col.text? && klass.serialized_attributes[col.name]
+            # RSI: changed sequence of next two lines - should check if value is nil before converting to yaml
             next if value.nil?  || (value == '')
+            value = value.to_yaml if col.text? && klass.serialized_attributes[col.name]
             uncached do
               lob = select_one("SELECT #{col.name} FROM #{table_name} WHERE #{klass.primary_key} = #{id} FOR UPDATE",
                                'Writable Large Object')[col.name]
@@ -422,6 +497,22 @@ begin
           end
         end
 
+        # RSI: change LOB column for ORDER BY clause
+        # just first 100 characters are taken for ordering
+        def lob_order_by_expression(klass, order)
+          return order if order.nil?
+          changed = false
+          new_order = order.to_s.strip.split(/, */).map do |order_by_col|
+            column_name, asc_desc = order_by_col.split(/ +/)
+            if column = klass.columns.detect { |col| col.name == column_name && col.sql_type =~ /LOB$/i}
+              changed = true
+              "DBMS_LOB.SUBSTR(#{column_name},100,1) #{asc_desc}"
+            else
+              order_by_col
+            end
+          end.join(', ')
+          changed ? new_order : order
+        end
 
         # SCHEMA STATEMENTS ========================================
         #
@@ -477,11 +568,29 @@ begin
           @ignore_table_columns[table_name]
         end
         
+        # RSI: set explicit type for specified table columns
+        def set_type_for_columns(table_name, column_type, *args)
+          @table_column_type ||= {}
+          @table_column_type[table_name] ||= {}
+          args.each do |col|
+            @table_column_type[table_name][col.to_s.downcase] = column_type
+          end
+        end
+        
+        def get_type_for_column(table_name, column_name)
+          result = @table_column_type && @table_column_type[table_name] && @table_column_type[table_name][column_name.to_s.downcase]
+          result
+        end
+
+        def clear_types_for_columns
+          @table_column_type = nil
+        end
+
         def columns(table_name, name = nil) #:nodoc:
           # RSI: get ignored_columns by original table name
           ignored_columns = ignored_table_columns(table_name)
 
-          (owner, table_name) = @connection.describe(table_name)
+          (owner, desc_table_name) = @connection.describe(table_name)
 
           table_cols = <<-SQL
             select column_name as name, data_type as sql_type, data_default, nullable,
@@ -493,7 +602,7 @@ begin
                    decode(data_type, 'NUMBER', data_scale, null) as scale
               from all_tab_columns
              where owner      = '#{owner}'
-               and table_name = '#{table_name}'
+               and table_name = '#{desc_table_name}'
              order by column_id
           SQL
 
@@ -516,14 +625,33 @@ begin
             OracleEnhancedColumn.new(oracle_downcase(row['name']),
                              row['data_default'],
                              row['sql_type'],
-                             row['nullable'] == 'Y')
+                             row['nullable'] == 'Y',
+                             # RSI: pass table name for table specific column definitions
+                             table_name,
+                             # RSI: pass column type if specified in class definition
+                             get_type_for_column(table_name, oracle_downcase(row['name'])))
           end
         end
 
-        def create_table(name, options = {}) #:nodoc:
-          super(name, options)
+        def create_table(name, options = {}, &block) #:nodoc:
+          create_sequence = options[:id] != false
+          if create_sequence
+            super(name, options, &block)
+          else
+            super(name, options) do |t|
+              class <<t
+                attr_accessor :create_sequence
+                def primary_key(*args)
+                  self.create_sequence = true
+                  super(*args)
+                end
+              end
+              result = block.call(t)
+              create_sequence = t.create_sequence
+            end
+          end
           seq_name = options[:sequence_name] || "#{name}_seq"
-          execute "CREATE SEQUENCE #{seq_name} START WITH 10000" unless options[:id] == false
+          execute "CREATE SEQUENCE #{seq_name} START WITH 10000" if create_sequence
         end
 
         def rename_table(name, new_name) #:nodoc:
@@ -685,9 +813,10 @@ begin
                 when OraDate
                   d = row[i]
                   # RSI: added emulate_dates_by_column_name functionality
-                  if emulate_dates_by_column_name && self.class.is_date_column?(col)
-                    d.to_date
-                  elsif emulate_dates && (d.hour == 0 && d.minute == 0 && d.second == 0)
+                  # if emulate_dates_by_column_name && self.class.is_date_column?(col)
+                  #   d.to_date
+                  # elsif
+                  if emulate_dates && (d.hour == 0 && d.minute == 0 && d.second == 0)
                     d.to_date
                   else
                     # see string_to_time; Time overflowing to DateTime, respecting the default timezone
@@ -765,7 +894,7 @@ begin
     def describe(name)
       @desc ||= @@env.alloc(OCIDescribe)
       @desc.attrSet(OCI_ATTR_DESC_PUBLIC, -1) if VERSION >= '0.1.14'
-      @desc.describeAny(@svc, name.to_s, OCI_PTYPE_UNK) rescue raise %Q{"DESC #{name}" failed; does it exist?}
+      do_ocicall(@ctx) { @desc.describeAny(@svc, name.to_s, OCI_PTYPE_UNK) } rescue raise %Q{"DESC #{name}" failed; does it exist?}
       info = @desc.attrGet(OCI_ATTR_PARAM)
 
       case info.attrGet(OCI_ATTR_PTYPE)
@@ -880,6 +1009,10 @@ begin
 
 rescue LoadError
   # OCI8 driver is unavailable.
+  if defined?(RAILS_DEFAULT_LOGGER)
+    RAILS_DEFAULT_LOGGER.error "ERROR: ActiveRecord oracle_enhanced adapter could not load ruby-oci8 library. "+
+                              "Please install ruby-oci8 library or gem."
+  end
   module ActiveRecord # :nodoc:
     class Base
       @@oracle_error_message = "Oracle/OCI libraries could not be loaded: #{$!.to_s}"
